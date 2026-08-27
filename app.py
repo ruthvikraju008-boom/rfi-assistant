@@ -368,7 +368,7 @@ elif page == "🔍 Search Repository":
 
     if query.strip():
         with get_session() as session:
-            results = hybrid_search(session, query, top_k=8, keyword_weight=kw_weight, semantic_weight=sem_weight)
+            results = hybrid_search(session, query, top_k=200, keyword_weight=kw_weight, semantic_weight=sem_weight)
             results = [(r.rfi.id, r) for r in results]  # keep ids to detach-safe re-fetch not needed; small scale
         if not results:
             st.warning("No matches found in the approved repository yet.")
