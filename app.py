@@ -17,6 +17,7 @@ import streamlit as st
 from core.database import (
     init_db, get_session, create_rfi, update_status, all_rfis, get_audit_trail,
 )
+from core.models import RFI
 from core.seed_data import seed_if_empty
 from core.parser import parse_rfi_pdf, parse_rfi_text, ParsedRFI
 from core.search import hybrid_search
@@ -135,11 +136,177 @@ elif page == "📤 Upload & Process RFI":
     source_filename = None
 
     if input_mode == "Upload PDF":
-        uploaded = st.file_uploader("RFI PDF", type=["pdf"])
-        if uploaded is not None:
-            source_filename = uploaded.name
-            parsed, full_text = parse_rfi_pdf(io.BytesIO(uploaded.getvalue()))
-            st.success("Text extracted and fields auto-parsed below — please review before saving.")
+        uploaded_files = st.file_uploader(
+            "RFI PDF(s)",
+            type=["pdf"],
+            accept_multiple_files=True,
+            help="Upload one PDF for the normal review flow, or up to 500 PDFs for automatic bulk processing.",
+        )
+
+        if uploaded_files:
+            if len(uploaded_files) > 500:
+                st.warning("You selected more than 500 PDFs. Only the first 500 will be processed.")
+                uploaded_files = uploaded_files[:500]
+
+            # Exactly one PDF keeps the existing manual review workflow.
+            if len(uploaded_files) == 1:
+                uploaded = uploaded_files[0]
+                source_filename = uploaded.name
+                parsed, full_text = parse_rfi_pdf(io.BytesIO(uploaded.getvalue()))
+                st.success("Text extracted and fields auto-parsed below — please review before saving.")
+            else:
+                st.info(
+                    f"📚 {len(uploaded_files)} PDFs selected. Bulk mode will parse and save each file automatically. "
+                    "Files with missing key fields go to the Reviewer Queue instead of stopping the batch."
+                )
+
+                if st.button(f"🚀 Process {len(uploaded_files)} RFIs", type="primary"):
+                    progress = st.progress(0, text="Starting bulk RFI processing...")
+                    results = {
+                        "approved": [],
+                        "review": [],
+                        "skipped": [],
+                        "failed": [],
+                    }
+
+                    for index, uploaded in enumerate(uploaded_files, start=1):
+                        filename = uploaded.name
+
+                        try:
+                            parsed_item, item_text = parse_rfi_pdf(
+                                io.BytesIO(uploaded.getvalue())
+                            )
+
+                            if not parsed_item.consideration_text or not parsed_item.consideration_text.strip():
+                                results["failed"].append(
+                                    (filename, "No consideration text could be extracted.")
+                                )
+                                progress.progress(
+                                    index / len(uploaded_files),
+                                    text=f"Processing {index}/{len(uploaded_files)} — {filename}",
+                                )
+                                continue
+
+                            with get_session() as session:
+                                duplicate = None
+
+                                if parsed_item.rfi_uuid:
+                                    duplicate = (
+                                        session.query(RFI)
+                                        .filter(RFI.rfi_uuid == parsed_item.rfi_uuid)
+                                        .first()
+                                    )
+
+                                if duplicate is None:
+                                    duplicate = (
+                                        session.query(RFI)
+                                        .filter(RFI.source_filename == filename)
+                                        .first()
+                                    )
+
+                                if duplicate is not None:
+                                    results["skipped"].append(
+                                        (filename, f"Already exists as RFI #{duplicate.id}.")
+                                    )
+                                    progress.progress(
+                                        index / len(uploaded_files),
+                                        text=f"Processing {index}/{len(uploaded_files)} — {filename}",
+                                    )
+                                    continue
+
+                                fields = dict(
+                                    application_id=parsed_item.application_id,
+                                    rfi_uuid=parsed_item.rfi_uuid,
+                                    evaluation_process=parsed_item.evaluation_process or "Validation",
+                                    msc=parsed_item.msc,
+                                    section_parts=parsed_item.section_parts,
+                                    section_document=parsed_item.section_document,
+                                    due_date=parsed_item.due_date,
+                                    response_date=parsed_item.response_date,
+                                    date_submitted=parsed_item.date_submitted,
+                                    consideration_number=parsed_item.consideration_number,
+                                    consideration_text=parsed_item.consideration_text,
+                                    sponsor_response=parsed_item.sponsor_response,
+                                    changes_made=parsed_item.changes_made,
+                                    reason_for_request=parsed_item.reason_for_request,
+                                    source_filename=filename,
+                                    full_text=item_text,
+                                )
+
+                                missing_fields = [
+                                    label
+                                    for label, value in [
+                                        ("Application ID", parsed_item.application_id),
+                                        ("RFI Unique Identifier", parsed_item.rfi_uuid),
+                                        ("MSC / Country", parsed_item.msc),
+                                        ("Application section parts", parsed_item.section_parts),
+                                        ("Section document", parsed_item.section_document),
+                                        ("Consideration", parsed_item.consideration_text),
+                                    ]
+                                    if not value or not str(value).strip()
+                                ]
+
+                                status = "pending_review" if missing_fields else "approved"
+
+                                rfi = create_rfi(
+                                    session,
+                                    fields,
+                                    actor=actor_name,
+                                    status=status,
+                                )
+                                new_id = rfi.id
+
+                            if missing_fields:
+                                results["review"].append(
+                                    (filename, new_id, ", ".join(missing_fields))
+                                )
+                            else:
+                                results["approved"].append((filename, new_id))
+
+                        except Exception as exc:
+                            # One bad PDF never aborts the entire batch.
+                            results["failed"].append((filename, str(exc)))
+
+                        progress.progress(
+                            index / len(uploaded_files),
+                            text=f"Processing {index}/{len(uploaded_files)} — {filename}",
+                        )
+
+                    progress.empty()
+
+                    st.success(
+                        f"Bulk processing complete: {len(results['approved'])} approved, "
+                        f"{len(results['review'])} sent to review, "
+                        f"{len(results['skipped'])} skipped, "
+                        f"{len(results['failed'])} failed. ✅"
+                    )
+
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Auto-approved", len(results["approved"]))
+                    m2.metric("Needs review", len(results["review"]))
+                    m3.metric("Duplicates skipped", len(results["skipped"]))
+                    m4.metric("Failed", len(results["failed"]))
+
+                    if results["review"]:
+                        with st.expander(f"⚠️ {len(results['review'])} files need review"):
+                            for filename, rfi_id, missing in results["review"]:
+                                st.write(
+                                    f"**RFI #{rfi_id} — {filename}** — missing: {missing}"
+                                )
+                            st.info("Open Reviewer Queue to inspect these records.")
+
+                    if results["skipped"]:
+                        with st.expander(f"↩️ {len(results['skipped'])} duplicates skipped"):
+                            for filename, reason in results["skipped"]:
+                                st.write(f"**{filename}** — {reason}")
+
+                    if results["failed"]:
+                        with st.expander(f"❌ {len(results['failed'])} files failed"):
+                            for filename, reason in results["failed"]:
+                                st.write(f"**{filename}** — {reason}")
+
+                # Never render the single-file review form for a bulk selection.
+                st.stop()
     elif input_mode == "Paste text":
         pasted = st.text_area("Paste the RFI text here", height=200)
         if pasted.strip():
