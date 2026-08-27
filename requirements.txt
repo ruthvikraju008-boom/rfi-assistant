@@ -1,0 +1,24 @@
+# Core app
+streamlit>=1.35
+sqlalchemy>=2.0
+pdfplumber>=0.11
+pandas>=2.0
+numpy>=1.26
+python-dotenv>=1.0
+scikit-learn>=1.4
+
+# NOTE for Streamlit Community Cloud deploys:
+# sentence-transformers (and its torch dependency) is deliberately left OUT
+# of this file. It's a very large install and commonly exceeds the free
+# tier's 1GB RAM / build time limits, causing the deploy to fail or crash.
+# The app auto-detects its absence and falls back to the built-in TF-IDF
+# semantic search — everything still works, including the Draft Assistant.
+# If you deploy somewhere with more resources and want real embeddings,
+# uncomment the line below:
+# sentence-transformers>=2.7
+
+# Only needed if you want real LLM-generated drafts instead of the built-in
+# template fallback. Anthropic is kept (used by default); OpenAI is commented
+# out to keep the install light — uncomment if you'll use OPENAI_API_KEY.
+anthropic>=0.34
+# openai>=1.40
